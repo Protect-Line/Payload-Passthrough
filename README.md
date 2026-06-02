@@ -1,2 +1,153 @@
-# Payload-Passthrough
+# Payload Passthrough
+
 Small PHP webhook bridge: receive a POST (or other configured method) on your server and forward the **same raw body** and selected headers to a locked-down API endpoint.
+
+Use this when the upstream API only accepts calls from specific domains or IPs, but your integration runs elsewhere. Point the third-party webhook at `webhook.php` on a host that is allowed, and set `target_url` in `config.php` to the real handler.
+
+No framework required. Uses PHP cURL.
+
+## Setup
+
+1. Copy `config.example.php` to `config.php`.
+2. Copy `allowlist.example.php` to `allowlist.php` (optional; see domain allowlist below).
+3. Set `target_url` to the final API webhook URL.
+4. Deploy `webhook.php` (and `includes/`) on a PHP host with cURL enabled.
+5. Configure the external service to POST to:
+
+   `https://your-bridge-domain.example/path/to/webhook.php`
+
+## Configuration
+
+| Option | Purpose |
+|--------|---------|
+| `target_url` | Upstream API endpoint (required) |
+| `timeout_seconds` | Outbound cURL timeout |
+| `follow_redirects` | Whether to follow redirects to the target |
+| `allowed_methods` | Methods accepted on the bridge (default `POST`) |
+| `preserve_http_method` | Forward the same verb, or always use POST |
+| `bridge_secret` | Optional shared secret; empty = disabled |
+| `bridge_secret_header` | Header name for the secret (default `X-Passthrough-Secret`) |
+| `forward_headers` | Exact incoming header names to copy |
+| `forward_header_prefixes` | Also copy headers starting with these prefixes |
+
+The request body is read from `php://input` and sent unchanged as the outbound body, so JSON, form-encoded, and binary payloads stay intact.
+
+## Domain allowlist (`allowlist.php`)
+
+Separate from `config.php`. Copy `allowlist.example.php` to `allowlist.php`.
+
+| Option | Purpose |
+|--------|---------|
+| `enabled` | When `true`, only listed domains may call the bridge |
+| `domains` | Allowed hostnames (`hooks.stripe.com`, `*.example.com`) |
+| `domain_sources` | Headers checked for a URL (`Origin`, `Referer`, …) |
+| `domain_header` | Optional header with a bare hostname (checked first) |
+
+The bridge extracts a hostname from the first matching header. Examples:
+
+- `Origin: https://hooks.stripe.com` → `hooks.stripe.com`
+- `X-Sender-Domain: my-proxy.example` → `my-proxy.example`
+
+If `enabled` is `true` but no `allowlist.php` exists, the allowlist is treated as disabled. If enabled with an empty `domains` list, requests are rejected with HTTP 500.
+
+Many webhook providers do not send `Origin` or `Referer`. Use `domain_header` and have your caller (or an edge proxy) set it, or leave `enabled` => `false` and rely on `bridge_secret` / server IP rules.
+
+## Health check
+
+`GET webhook.php` returns JSON status (does not expose `target_url`):
+
+```json
+{
+  "status": "ok",
+  "service": "payload-passthrough",
+  "target_configured": true,
+  "allowed_methods": ["POST"],
+  "domain_allowlist_enabled": true
+}
+```
+
+## Example forward
+
+Incoming:
+
+```http
+POST /webhook.php HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer upstream-token
+X-Custom-Event: order.paid
+
+{"id": 42, "amount": 19.99}
+```
+
+Outbound (to `target_url`):
+
+- Same body bytes
+- `Content-Type`, `Authorization`, and `X-Custom-Event` forwarded (per your config)
+
+## Response passthrough
+
+The bridge is a **synchronous proxy**. Whatever the target API returns is relayed back to whoever POSTed to `webhook.php`.
+
+```
+Origin  →  POST webhook.php  →  POST target_url  →  target responds
+Origin  ←  same status/body   ←  bridge relays    ←
+```
+
+### What the origin receives
+
+When the target is reached successfully, the caller gets the **target’s** response unchanged in substance:
+
+| From target | Back to origin |
+|-------------|----------------|
+| `200` + `ok` or JSON payload | Same status code and body |
+| `4xx` / `5xx` + error JSON or text | Same status code and body |
+| Custom headers (`Content-Type`, etc.) | Copied (hop-by-hop headers like `Transfer-Encoding` are skipped) |
+
+Examples:
+
+- Target returns `200` with `{"status":"ok"}` → origin sees `200` and that JSON.
+- Target returns `422` with validation errors → origin sees `422` and that error payload.
+
+Many webhook providers only check the HTTP status (2xx = success, may retry on 5xx). Others read the response body; both work as long as the target responds within `timeout_seconds`.
+
+### When the origin does *not* get the target response
+
+The bridge answers on its own only **before** forwarding, or when the outbound call fails:
+
+| Situation | What the origin sees |
+|-----------|----------------------|
+| Invalid or missing bridge secret | `403` — bridge JSON |
+| Sending domain not on allowlist | `403` — bridge JSON |
+| Network / cURL failure (timeout, DNS, connection) | `502` — bridge JSON (`"Upstream request failed."`) |
+| Missing or invalid `target_url` in config | `500` — bridge JSON |
+
+Those responses are generated by the bridge, not wrapped inside the target’s format.
+
+### Safety and operational notes
+
+- **Lock down the bridge** — Only trusted callers should reach `webhook.php` (secret, domain allowlist, server IP rules). Anything the target returns (including error details) is visible to the caller.
+- **Error leakage** — A target `500` body may include internal messages; that is passed through by design. Restrict who can hit the bridge if that matters.
+- **Timeouts** — Default 30 seconds (`timeout_seconds`). If the target is slower, the origin gets a bridge `502`, not the target body; some providers will retry.
+- **Large responses** — The full upstream body is buffered in memory once, like a normal PHP proxy.
+- **Request vs response** — The incoming POST body and forwarded request headers are sent to the target; only the **response** is relayed back to the origin.
+
+## Security notes
+
+- Use HTTPS on both the bridge and `target_url`.
+- Set `bridge_secret` and require callers to send it in `bridge_secret_header` so random traffic cannot use your bridge.
+- Restrict access at the web server (IP allowlist, basic auth) if the upstream only trusts your server IP.
+- Do not commit `config.php` or `allowlist.php` (both are gitignored).
+
+## Requirements
+
+- PHP 8.0+ (uses `str_starts_with`, `str_contains`)
+- cURL extension
+
+## Files
+
+- `webhook.php` — entry point
+- `config.example.php` — bridge / forward settings
+- `allowlist.example.php` — sending domain allowlist
+- `includes/bootstrap.php` — config load, auth, header filtering
+- `includes/allowlist.php` — domain detection and allowlist checks
+- `includes/passthrough.php` — cURL forward and response relay
