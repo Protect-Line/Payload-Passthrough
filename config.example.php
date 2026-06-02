@@ -37,4 +37,11 @@ return [
 
     // Also forward headers whose names start with any of these prefixes (e.g. X-*, Stripe-*)
     'forward_header_prefixes' => ['X-', 'Stripe-'],
+
+    // Basic request lifecycle logging (metadata only, never payload/body contents)
+    'logging_enabled' => true,
+    'log_directory' => __DIR__ . '/.log',
+    'log_file' => 'events.log',
+    'log_max_size_bytes' => 2 * 1024 * 1024, // 2MB
+    'log_max_age_days' => 30,
 ];

@@ -1,2 +1,4 @@
 config.php
 allowlist.php
+.log/*.log
+!.log/.gitkeep
