@@ -11,8 +11,9 @@ No framework required. Uses PHP cURL.
 1. Copy `config.example.php` to `config.php`.
 2. Copy `allowlist.example.php` to `allowlist.php` in the project root (optional; see domain allowlist below).
 3. Set `target_url` to the final API webhook URL.
-4. Deploy `webhook.php` (and `includes/`) on a PHP host with cURL enabled.
-5. Configure the external service to POST to:
+4. Set `bridge_secret` in `config.php` if you want header-based auth on the bridge (recommended when the domain allowlist is off).
+5. Deploy `webhook.php` and the `includes/` folder on a PHP host with cURL enabled. Commit `includes/allowedlist.php` from the repo — do **not** confuse it with root `allowlist.php` (see Files below).
+6. Configure the external service to POST to:
 
    `https://your-bridge-domain.example/path/to/webhook.php`
 
@@ -37,9 +38,71 @@ No framework required. Uses PHP cURL.
 
 The request body is read from `php://input` and sent unchanged as the outbound body, so JSON, form-encoded, and binary payloads stay intact.
 
+## Securing the bridge
+
+You can lock down `webhook.php` in two ways (or combine them):
+
+| Method | Config | Best for |
+|--------|--------|----------|
+| **Bridge secret** | `bridge_secret` + `bridge_secret_header` in `config.php` | Server-to-server webhooks that can send a custom header |
+| **Domain allowlist** | `allowlist.php` in the project root | Browser or proxy callers that send `Origin`, `Referer`, or `X-Sender-Domain` |
+
+Checks run in this order on each POST: allowed method → bridge secret (if set) → domain allowlist (if enabled) → forward to `target_url`.
+
+### Bridge secret (header auth)
+
+Set a long random value in `config.php`:
+
+```php
+'bridge_secret' => 'your-long-random-secret-here',
+'bridge_secret_header' => 'X-Passthrough-Secret',
+```
+
+The sending service must include that header on every request to the bridge. Missing or wrong values return `403` with `"Invalid or missing bridge secret."` — the request never reaches `target_url`.
+
+Example caller request:
+
+```http
+POST /path/to/webhook.php HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer upstream-api-key
+X-Passthrough-Secret: your-long-random-secret-here
+
+{"id": 42}
+```
+
+**Two different headers:**
+
+| Header | Purpose |
+|--------|---------|
+| `bridge_secret_header` (e.g. `X-Passthrough-Secret`) | Authenticates **to the bridge** — checked and consumed by the bridge |
+| `Authorization` | Forwarded **to the upstream API** — authenticates with the receiving service |
+
+These are independent. The bridge secret stops arbitrary traffic; `Authorization` is whatever the target API expects.
+
+**Keep the bridge secret off the upstream call:** by default, `forward_header_prefixes` includes `X-`, so an `X-Passthrough-Secret` header would also be forwarded. To avoid that, use a header name that does not match `forward_headers` or any prefix (e.g. `Bridge-Secret`):
+
+```php
+'bridge_secret_header' => 'Bridge-Secret',
+```
+
+Callers then send `Bridge-Secret: ...` instead.
+
+### Domain allowlist off + bridge secret on
+
+For typical server-to-server webhooks (no `Origin` / `Referer`), disable the domain check and rely on the shared secret:
+
+In root `allowlist.php`:
+
+```php
+'enabled' => false,
+```
+
+In `config.php`, set `bridge_secret` to a strong random string and give that value to the sending service.
+
 ## Domain allowlist (`allowlist.php`)
 
-Separate from `config.php`. Copy `allowlist.example.php` to `allowlist.php` in the project root (same level as `webhook.php`).
+Separate from `config.php`. Copy `allowlist.example.php` to `allowlist.php` in the project root (same level as `webhook.php`). This is **configuration data** only — the allowlist **logic** lives in `includes/allowedlist.php` (tracked in git). Both names are similar; only root `allowlist.php` is gitignored.
 
 | Option | Purpose |
 |--------|---------|
@@ -55,7 +118,13 @@ The bridge extracts a hostname from the first matching header. Examples:
 
 If `enabled` is `true` but no `allowlist.php` exists, the allowlist is treated as disabled. If enabled with an empty `domains` list, requests are rejected with HTTP 500.
 
-Many webhook providers do not send `Origin` or `Referer`. Use `domain_header` and have your caller (or an edge proxy) set it, or leave `enabled` => `false` and rely on `bridge_secret` / server IP rules.
+Many webhook providers do not send `Origin` or `Referer`. If the allowlist is enabled and no sending domain can be detected, the bridge returns `403` with `"Could not determine sending domain from request headers."` — check logs for `"sending_domain": "unknown"`.
+
+Options:
+
+- Have the caller (or an edge proxy) send `X-Sender-Domain` (or your configured `domain_header`) with an allowed hostname.
+- Set `'enabled' => false` and use `bridge_secret` instead (see [Securing the bridge](#securing-the-bridge)).
+- Restrict access at the web server (IP allowlist, basic auth).
 
 ## Logging (no payload data)
 
@@ -64,6 +133,13 @@ Basic request lifecycle logging is enabled by default and writes JSON lines to `
 - Logged fields include timestamps, request id, method, sending domain, target endpoint, response source, upstream status, final status, and duration.
 - Payload body, request packet contents, and response body contents are **never** logged.
 - Error paths are also logged (method denied, auth/allowlist failures, upstream failures) via a completion event.
+
+**Reading `response_source`:**
+
+| Value | Meaning |
+|-------|---------|
+| `"bridge"` | The bridge rejected the request or failed before calling upstream. `"upstream_status"` is `null`. Common causes: missing bridge secret, allowlist failure. |
+| `"upstream"` | The outbound call to `target_url` was made. `"upstream_status"` shows what the target returned. |
 
 ### Rotation policy
 
@@ -113,6 +189,7 @@ Incoming:
 POST /webhook.php HTTP/1.1
 Content-Type: application/json
 Authorization: Bearer upstream-token
+X-Passthrough-Secret: bridge-shared-secret
 X-Custom-Event: order.paid
 
 {"id": 42, "amount": 19.99}
@@ -122,6 +199,7 @@ Outbound (to `target_url`):
 
 - Same body bytes
 - `Content-Type`, `Authorization`, and `X-Custom-Event` forwarded (per your config)
+- `X-Passthrough-Secret` is checked by the bridge only (not forwarded if you use a non-`X-` header name such as `Bridge-Secret`)
 
 ## Response passthrough
 
@@ -155,10 +233,12 @@ The bridge answers on its own only **before** forwarding, or when the outbound c
 
 | Situation | What the origin sees |
 |-----------|----------------------|
-| Invalid or missing bridge secret | `403` — bridge JSON |
-| Sending domain not on allowlist | `403` — bridge JSON |
+| Invalid or missing bridge secret | `403` — bridge JSON (`"Invalid or missing bridge secret."`) |
+| Allowlist on but sending domain not detected | `403` — bridge JSON (`"Could not determine sending domain from request headers."`) |
+| Sending domain not on allowlist | `403` — bridge JSON (`"Sending domain is not allowed."`) |
 | Network / cURL failure (timeout, DNS, connection) | `502` — bridge JSON (`"Upstream request failed."`) |
 | Missing or invalid `target_url` in config | `500` — bridge JSON |
+| Upstream rejects auth or payload | Same status/body from target (e.g. upstream `403`) — `"response_source": "upstream"` in logs |
 
 Those responses are generated by the bridge, not wrapped inside the target’s format.
 
@@ -173,9 +253,10 @@ Those responses are generated by the bridge, not wrapped inside the target’s f
 ## Security notes
 
 - Use HTTPS on both the bridge and `target_url`.
-- Set `bridge_secret` and require callers to send it in `bridge_secret_header` so random traffic cannot use your bridge.
+- Prefer `bridge_secret` for server-to-server webhooks; use the domain allowlist when callers reliably send `Origin`, `Referer`, or `X-Sender-Domain`.
 - Restrict access at the web server (IP allowlist, basic auth) if the upstream only trusts your server IP.
-- Do not commit `config.php` or `allowlist.php` (both are gitignored).
+- On Apache, the `Authorization` header may not reach PHP unless the server passes it through (e.g. `RewriteRule` setting `HTTP_AUTHORIZATION`). If upstream auth fails despite correct config, verify PHP receives the header.
+- Do not commit `config.php` or root `allowlist.php` (both are gitignored). Do commit `includes/allowedlist.php`.
 - Do not commit log output from `.log/*.log` (gitignored).
 
 ## Requirements
@@ -185,11 +266,15 @@ Those responses are generated by the bridge, not wrapped inside the target’s f
 
 ## Files
 
-- `webhook.php` — entry point
-- `config.example.php` — bridge / forward settings
-- `allowlist.example.php` — sending domain allowlist
-- `.log/.htaccess` and `.log/web.config` — block direct public access to logs
-- `includes/bootstrap.php` — config load, auth, header filtering
-- `includes/allowedlist.php` — domain detection and allowlist checks
-- `includes/logging.php` — metadata-only logging and rotation
-- `includes/passthrough.php` — cURL forward and response relay
+| File | Role | In git? |
+|------|------|---------|
+| `webhook.php` | Entry point | Yes |
+| `config.example.php` | Example bridge / forward settings | Yes |
+| `config.php` | Your bridge config (`target_url`, `bridge_secret`, …) | No (gitignored) |
+| `allowlist.example.php` | Example domain allowlist config | Yes |
+| `allowlist.php` | Your domain allowlist config (`enabled`, `domains`, …) | No (gitignored) |
+| `includes/allowedlist.php` | Allowlist logic (`load_allowlist()`, domain checks) | Yes |
+| `includes/bootstrap.php` | Config load, bridge secret, header filtering | Yes |
+| `includes/logging.php` | Metadata-only logging and rotation | Yes |
+| `includes/passthrough.php` | cURL forward and response relay | Yes |
+| `.log/.htaccess`, `.log/web.config` | Block direct public access to logs | Yes |
